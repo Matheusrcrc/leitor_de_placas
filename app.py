@@ -31,14 +31,22 @@ def enhance_image(image):
     # Converte para escala de cinza
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Equalização de histograma adaptativa
+    # Aumenta o contraste
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
     
     # Redução de ruído
     denoised = cv2.fastNlMeansDenoising(enhanced)
     
-    return denoised
+    # Binarização adaptativa
+    binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                 cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # Operações morfológicas para limpar ruídos
+    kernel = np.ones((2,2), np.uint8)
+    clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    
+    return clean
 
 def find_plate_candidates(image):
     """Encontra regiões candidatas a serem placas"""
@@ -71,13 +79,35 @@ def is_plate_format(text):
     # Remove espaços e caracteres especiais
     text = ''.join(e for e in text if e.isalnum()).upper()
     
+    if len(text) != 7:
+        return False
+        
+    # Caracteres comumente confundidos
+    text = text.replace('O', '0').replace('I', '1').replace('Z', '2')
+    text = text.replace('S', '5').replace('B', '8').replace('Q', '0')
+    
     # Verifica formato antigo (ABC1234)
-    if len(text) == 7 and text[:3].isalpha() and text[3:].isdigit():
+    if text[:3].isalpha() and text[3:].isdigit():
         return True
     
     # Verifica formato Mercosul (ABC1D23)
-    if len(text) == 7 and text[:3].isalpha() and text[3].isdigit() and text[4].isalpha() and text[5:].isdigit():
+    if (text[:3].isalpha() and text[3].isdigit() and 
+        text[4].isalpha() and text[5:].isdigit()):
         return True
+        
+    # Tenta correções comuns para placas Mercosul
+    if len(text) >= 7:
+        # Tenta interpretar caracteres confusos
+        potential_plate = list(text)
+        # Tenta converter números em letras nas posições corretas
+        if text[4].isdigit():
+            letter_map = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B'}
+            if text[4] in letter_map:
+                potential_plate[4] = letter_map[text[4]]
+                new_text = ''.join(potential_plate)
+                if (new_text[:3].isalpha() and new_text[3].isdigit() and 
+                    new_text[4].isalpha() and new_text[5:].isdigit()):
+                    return True
     
     return False
 
@@ -88,12 +118,21 @@ def process_image_region(image, reader, x=None, y=None, w=None, h=None):
     else:
         region = image
     
+    # Redimensiona a imagem para um tamanho maior
+    scale = 2
+    height, width = region.shape[:2]
+    region = cv2.resize(region, (width * scale, height * scale))
+    
     # Lista de transformações para tentar
     transforms = [
         lambda img: img,  # Original
         lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),  # Escala de cinza
         lambda img: enhance_image(img),  # Melhorada
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]  # Binarização
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 127, 255, cv2.THRESH_BINARY)[1],  # Binarização simples
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],  # Binarização Otsu
+        # Transformações específicas para Mercosul
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 200, 255, cv2.THRESH_BINARY)[1],  # Alto threshold para fundo branco
+        lambda img: cv2.adaptiveThreshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 11)  # Adaptativo mais agressivo
     ]
     
     best_result = None
