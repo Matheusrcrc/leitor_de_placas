@@ -7,20 +7,41 @@ from datetime import datetime
 import os
 from PIL import Image
 import io
+import gc
 
 # Configuração da página Streamlit
-st.set_page_config(page_title="Detecção de Placas", layout="wide")
+st.set_page_config(
+    page_title="Detecção de Placas",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Configuração do estado da aplicação
+# Inicialização dos estados globais
+if 'ocr_reader' not in st.session_state:
+    st.session_state.ocr_reader = None
 if 'detections_data' not in st.session_state:
     st.session_state.detections_data = []
 
-# Inicialização do EasyOCR
-@st.cache_resource
+# Inicialização do EasyOCR com gerenciamento de recursos
+@st.cache_resource(show_spinner=True)
 def load_ocr():
-    reader = easyocr.Reader(['en', 'pt'], gpu=False)
-    reader.detector.eval()
-    return reader
+    try:
+        if st.session_state.ocr_reader is None:
+            st.session_state.ocr_reader = easyocr.Reader(['en', 'pt'], gpu=False)
+            st.session_state.ocr_reader.detector.eval()
+        return st.session_state.ocr_reader
+    except Exception as e:
+        st.error(f"Erro ao carregar OCR: {str(e)}")
+        return None
+
+# Função para limpar recursos
+def cleanup_resources():
+    if st.session_state.ocr_reader is not None:
+        del st.session_state.ocr_reader
+        st.session_state.ocr_reader = None
+    gc.collect()
+
+# Resto do código permanece o mesmo...
 
 def compress_image(image, max_size=800):
     """Comprime a imagem mantendo a proporção"""
