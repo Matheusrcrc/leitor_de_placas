@@ -24,10 +24,7 @@ def load_ocr():
 # Inicialização do modelo YOLO
 @st.cache_resource
 def load_model():
-    # Usando modelo base do YOLOv8
     model = YOLO('yolov8n.pt')
-    # Configurando para detectar apenas a classe 2 (carros) e 7 (caminhões)
-    model.classes = [2, 7]
     return model
 
 def is_plate_format(text):
@@ -128,25 +125,39 @@ def main():
             st.subheader("Imagem Original")
             st.image(image, channels="BGR")
         
-        # Detectando veículos na imagem
+        # Detectando objetos na imagem
         with st.spinner("Processando imagem..."):
-            results = model(image, conf=confidence_threshold)
+            results = model(image)
         
         # Processando detecções
         detections = []
         output_image = image.copy()
         
+        # Primeiro, vamos tentar processar a imagem inteira
+        plate_text_full = process_plate(image, reader)
+        if plate_text_full:
+            height, width = image.shape[:2]
+            detections.append({
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'placa': plate_text_full,
+                'thumbnail_path': 'thumbnails/full_image.jpg',
+                'confianca': 1.0
+            })
+            cv2.putText(output_image, plate_text_full, (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Depois, vamos processar as detecções do YOLO
         for result in results:
             boxes = result.boxes
             for box in boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 
-                # Expande um pouco a região para capturar melhor a placa
+                # Expande a região
                 height, width = image.shape[:2]
-                y1 = max(0, y1 - 20)
-                y2 = min(height, y2 + 20)
-                x1 = max(0, x1 - 20)
-                x2 = min(width, x2 + 20)
+                y1 = max(0, y1 - 30)
+                y2 = min(height, y2 + 30)
+                x1 = max(0, x1 - 30)
+                x2 = min(width, x2 + 30)
                 
                 # Recortando a região do veículo
                 vehicle_region = image[y1:y2, x1:x2]
