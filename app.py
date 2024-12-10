@@ -19,7 +19,9 @@ if 'detections_data' not in st.session_state:
 # Inicialização do EasyOCR
 @st.cache_resource
 def load_ocr():
-    return easyocr.Reader(['en', 'pt'])
+    reader = easyocr.Reader(['en', 'pt'], gpu=False)
+    reader.detector.eval()  # Modo de avaliação para melhor precisão
+    return reader
 
 # Inicialização do modelo YOLO
 @st.cache_resource
@@ -119,21 +121,72 @@ def process_image_region(image, reader, x=None, y=None, w=None, h=None):
         region = image
     
     # Redimensiona a imagem para um tamanho maior
-    scale = 2
+    scale = 3  # Aumentado para 3x
     height, width = region.shape[:2]
     region = cv2.resize(region, (width * scale, height * scale))
+    
+    def preprocess_mercosul(img):
+        # Converte para HSV para melhor segmentação de cores
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Máscara para cor azul (faixa superior da placa Mercosul)
+        lower_blue = np.array([100, 50, 50])
+        upper_blue = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        
+        # Realce de contraste
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        contrasted = clahe.apply(gray)
+        
+        # Binarização adaptativa
+        binary = cv2.adaptiveThreshold(contrasted, 255, 
+                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 11, 2)
+        
+        # Combina com a máscara azul
+        result = cv2.bitwise_or(binary, blue_mask)
+        return result
     
     # Lista de transformações para tentar
     transforms = [
         lambda img: img,  # Original
         lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),  # Escala de cinza
-        lambda img: enhance_image(img),  # Melhorada
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 127, 255, cv2.THRESH_BINARY)[1],  # Binarização simples
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],  # Binarização Otsu
-        # Transformações específicas para Mercosul
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 200, 255, cv2.THRESH_BINARY)[1],  # Alto threshold para fundo branco
-        lambda img: cv2.adaptiveThreshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 11)  # Adaptativo mais agressivo
+        lambda img: preprocess_mercosul(img),  # Pré-processamento específico Mercosul
+        # Transformações com diferentes níveis de threshold
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 127, 255, cv2.THRESH_BINARY)[1],
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 200, 255, cv2.THRESH_BINARY)[1],
     ]
+    
+    best_result = None
+    best_confidence = 0
+    
+    for transform in transforms:
+        try:
+            processed = transform(region)
+            
+            # Configurações específicas do EasyOCR para melhor detecção
+            results = reader.readtext(
+                processed,
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                batch_size=1,
+                detail=1,
+                paragraph=False,
+                height_ths=0.5,
+                width_ths=0.5,
+                rotation_info=[-5, 5]  # Permite pequena rotação
+            )
+            
+            for bbox, text, conf in results:
+                clean_text = ''.join(e for e in text if e.isalnum()).upper()
+                if is_plate_format(clean_text) and conf > best_confidence:
+                    best_result = (clean_text, conf)
+                    best_confidence = conf
+        except Exception as e:
+            continue
+            
+    return best_result if best_result and best_result[1] > 0.2 else None
     
     best_result = None
     best_confidence = 0
