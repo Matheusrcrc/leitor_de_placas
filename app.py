@@ -113,50 +113,105 @@ def is_plate_format(text):
     
     return False
 
+def compress_image(image, max_size=800):
+    """Comprime a imagem mantendo a proporção"""
+    height, width = image.shape[:2]
+    
+    # Calcula a nova dimensão mantendo a proporção
+    if width > height:
+        if width > max_size:
+            ratio = max_size / width
+            new_width = max_size
+            new_height = int(height * ratio)
+        else:
+            return image
+    else:
+        if height > max_size:
+            ratio = max_size / height
+            new_height = max_size
+            new_width = int(width * ratio)
+        else:
+            return image
+    
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+def find_plate_region(image):
+    """Encontra a região retangular da placa na imagem"""
+    # Converte para escala de cinza
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Aplica blur para reduzir ruído
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Detecta bordas
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Encontra contornos
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    plate_candidates = []
+    height, width = image.shape[:2]
+    min_area = (width * height) * 0.01  # 1% da área da imagem
+    max_area = (width * height) * 0.15  # 15% da área da imagem
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if min_area < area < max_area:
+            # Aproxima o contorno para um polígono
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+            
+            # Verifica se é um retângulo (4 vértices)
+            if len(approx) == 4:
+                x, y, w, h = cv2.boundingRect(approx)
+                aspect_ratio = float(w) / h
+                
+                # Verifica se tem proporção típica de placa (3:1 até 4:1)
+                if 2.5 <= aspect_ratio <= 4.5:
+                    plate_candidates.append((x, y, w, h, area))
+    
+    # Retorna o candidato com maior área
+    if plate_candidates:
+        return max(plate_candidates, key=lambda x: x[4])[:4]
+    return None
+
 def process_image_region(image, reader, x=None, y=None, w=None, h=None):
     """Processa uma região da imagem para encontrar placa"""
+    # Comprime a imagem se necessário
+    image = compress_image(image)
+    
     if x is not None:
+        # Expande um pouco a região para garantir
+        height, width = image.shape[:2]
+        x = max(0, x - 5)
+        y = max(0, y - 5)
+        w = min(width - x, w + 10)
+        h = min(height - y, h + 10)
         region = image[y:y+h, x:x+w]
     else:
-        region = image
+        # Tenta encontrar a região da placa
+        plate_rect = find_plate_region(image)
+        if plate_rect:
+            x, y, w, h = plate_rect
+            region = image[y:y+h, x:x+w]
+        else:
+            region = image
     
-    # Redimensiona a imagem para um tamanho maior
-    scale = 3  # Aumentado para 3x
-    height, width = region.shape[:2]
-    region = cv2.resize(region, (width * scale, height * scale))
-    
-    def preprocess_mercosul(img):
-        # Converte para HSV para melhor segmentação de cores
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        # Máscara para cor azul (faixa superior da placa Mercosul)
-        lower_blue = np.array([100, 50, 50])
-        upper_blue = np.array([130, 255, 255])
-        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        
-        # Realce de contraste
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        contrasted = clahe.apply(gray)
-        
-        # Binarização adaptativa
-        binary = cv2.adaptiveThreshold(contrasted, 255, 
-                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, 11, 2)
-        
-        # Combina com a máscara azul
-        result = cv2.bitwise_or(binary, blue_mask)
-        return result
+    # Redimensiona a região para um tamanho padrão
+    target_width = 400  # Largura padrão para processamento
+    aspect_ratio = region.shape[1] / region.shape[0]
+    target_height = int(target_width / aspect_ratio)
+    region = cv2.resize(region, (target_width, target_height))
     
     # Lista de transformações para tentar
     transforms = [
         lambda img: img,  # Original
         lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),  # Escala de cinza
-        lambda img: preprocess_mercosul(img),  # Pré-processamento específico Mercosul
-        # Transformações com diferentes níveis de threshold
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 127, 255, cv2.THRESH_BINARY)[1],
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 200, 255, cv2.THRESH_BINARY)[1],
+        lambda img: cv2.threshold(
+            cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 
+            0, 255, 
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]  # Binarização Otsu
     ]
     
     best_result = None
@@ -165,17 +220,13 @@ def process_image_region(image, reader, x=None, y=None, w=None, h=None):
     for transform in transforms:
         try:
             processed = transform(region)
-            
-            # Configurações específicas do EasyOCR para melhor detecção
             results = reader.readtext(
                 processed,
                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
                 batch_size=1,
-                detail=1,
                 paragraph=False,
                 height_ths=0.5,
-                width_ths=0.5,
-                rotation_info=[-5, 5]  # Permite pequena rotação
+                width_ths=0.5
             )
             
             for bbox, text, conf in results:
@@ -185,7 +236,7 @@ def process_image_region(image, reader, x=None, y=None, w=None, h=None):
                     best_confidence = conf
         except Exception as e:
             continue
-            
+    
     return best_result if best_result and best_result[1] > 0.2 else None
     
     best_result = None
@@ -215,16 +266,16 @@ def main():
     
     # Carregando modelos com indicador de progresso
     with st.spinner("Carregando modelos..."):
-        model = load_model()
         reader = load_ocr()
     
     # Interface para upload de imagem
     uploaded_file = st.file_uploader("Escolha uma imagem", type=['jpg', 'jpeg', 'png'])
     
     if uploaded_file is not None:
-        # Convertendo a imagem
+        # Lê e comprime a imagem
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         image = cv2.imdecode(file_bytes, 1)
+        image = compress_image(image)
         
         # Criando colunas para exibição
         col1, col2 = st.columns(2)
@@ -233,24 +284,53 @@ def main():
             st.subheader("Imagem Original")
             st.image(image, channels="BGR")
         
+        # Processa a imagem
         output_image = image.copy()
         detections = []
         
-        # Primeiro tenta processar a imagem inteira
-        plate_result = process_image_region(image, reader)
+        # Tenta encontrar a região da placa
+        plate_rect = find_plate_region(image)
         
-        if plate_result:
-            plate_text, conf = plate_result
-            if conf > confidence_threshold:
-                detections.append({
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'placa': plate_text,
-                    'confianca': conf
-                })
-                cv2.putText(output_image, f"{plate_text} ({conf:.2f})", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        if plate_rect:
+            x, y, w, h = plate_rect
+            # Desenha retângulo na região detectada
+            cv2.rectangle(output_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Processa a região da placa
+            plate_result = process_image_region(image, reader, x, y, w, h)
+            
+            if plate_result:
+                plate_text, conf = plate_result
+                if conf > confidence_threshold:
+                    detections.append({
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'placa': plate_text,
+                        'confianca': conf
+                    })
+                    # Adiciona texto acima do retângulo
+                    cv2.putText(output_image, f"{plate_text} ({conf:.2f})", 
+                              (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 
+                              (0, 255, 0), 2)
         
-        # Se não encontrou na imagem inteira, procura por regiões candidatas
+        with col2:
+            st.subheader("Detecções")
+            st.image(output_image, channels="BGR")
+        
+        if detections:
+            st.subheader("Registro de Detecções")
+            df = pd.DataFrame(detections)
+            st.dataframe(df, use_container_width=True)
+            
+            if st.button("Baixar Registros (CSV)"):
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Clique para baixar",
+                    data=csv,
+                    file_name="deteccoes_placas.csv",
+                    mime="text/csv"
+                )
+        else:
+            st.warning("Nenhuma placa detectada na imagem."), procura por regiões candidatas
         if not detections:
             candidates = find_plate_candidates(image)
             
