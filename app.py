@@ -24,8 +24,47 @@ def load_ocr():
 # Inicialização do modelo YOLO
 @st.cache_resource
 def load_model():
-    model = YOLO('yolov8n.pt')
-    return model
+    return YOLO('yolov8n.pt')
+
+def enhance_image(image):
+    """Melhora a imagem para detecção de placas"""
+    # Converte para escala de cinza
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Equalização de histograma adaptativa
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+    
+    # Redução de ruído
+    denoised = cv2.fastNlMeansDenoising(enhanced)
+    
+    return denoised
+
+def find_plate_candidates(image):
+    """Encontra regiões candidatas a serem placas"""
+    # Melhora a imagem
+    enhanced = enhance_image(image)
+    
+    # Detecção de bordas
+    edges = cv2.Canny(enhanced, 50, 150)
+    
+    # Encontra contornos
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    candidates = []
+    height, width = image.shape[:2]
+    min_area = (width * height) * 0.01  # 1% da área da imagem
+    max_area = (width * height) * 0.15  # 15% da área da imagem
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if min_area < area < max_area:
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = float(w) / h
+            if 1.5 <= aspect_ratio <= 4.5:  # Proporção típica de placas
+                candidates.append((x, y, w, h))
+    
+    return candidates
 
 def is_plate_format(text):
     """Valida o formato da placa brasileira (antiga e Mercosul)"""
@@ -42,68 +81,45 @@ def is_plate_format(text):
     
     return False
 
-def preprocess_plate_image(img):
-    """Pré-processa a imagem para melhorar o OCR"""
-    try:
-        # Converte para escala de cinza
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Aumenta o contraste
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        
-        # Reduz ruído
-        denoised = cv2.fastNlMeansDenoising(gray)
-        
-        # Binarização adaptativa
-        binary = cv2.adaptiveThreshold(denoised, 255, 
-                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, 11, 2)
-        
-        # Operações morfológicas para limpar a imagem
-        kernel = np.ones((2,2), np.uint8)
-        processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        
-        return processed
-    except Exception as e:
-        st.error(f"Erro no pré-processamento: {str(e)}")
-        return img
-
-def process_plate(image, ocr_reader):
-    try:
-        # Pré-processa a imagem
-        processed_img = preprocess_plate_image(image)
-        
-        # Aumenta o tamanho da imagem para melhor OCR
-        height, width = processed_img.shape[:2]
-        processed_img = cv2.resize(processed_img, (width*2, height*2))
-        
-        # Executa OCR
-        results = ocr_reader.readtext(processed_img)
-        
-        valid_plates = []
-        for (bbox, text, prob) in results:
-            # Remove espaços e caracteres especiais
-            clean_text = ''.join(e for e in text if e.isalnum()).upper()
+def process_image_region(image, reader, x=None, y=None, w=None, h=None):
+    """Processa uma região da imagem para encontrar placa"""
+    if x is not None:
+        region = image[y:y+h, x:x+w]
+    else:
+        region = image
+    
+    # Lista de transformações para tentar
+    transforms = [
+        lambda img: img,  # Original
+        lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),  # Escala de cinza
+        lambda img: enhance_image(img),  # Melhorada
+        lambda img: cv2.threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]  # Binarização
+    ]
+    
+    best_result = None
+    best_confidence = 0
+    
+    for transform in transforms:
+        try:
+            processed = transform(region)
+            results = reader.readtext(processed)
             
-            if is_plate_format(clean_text) and prob > 0.5:
-                valid_plates.append((clean_text, prob))
-        
-        if valid_plates:
-            # Retorna a placa com maior confiança
-            return max(valid_plates, key=lambda x: x[1])[0]
-            
-        return None
-    except Exception as e:
-        st.error(f"Erro ao processar placa: {str(e)}")
-        return None
+            for bbox, text, conf in results:
+                clean_text = ''.join(e for e in text if e.isalnum()).upper()
+                if is_plate_format(clean_text) and conf > best_confidence:
+                    best_result = (clean_text, conf)
+                    best_confidence = conf
+        except:
+            continue
+    
+    return best_result
 
 def main():
     st.title("Sistema de Detecção de Placas de Veículos")
     
     with st.sidebar:
         st.header("Configurações")
-        confidence_threshold = st.slider("Limite de Confiança", 0.0, 1.0, 0.25)
+        confidence_threshold = st.slider("Limite de Confiança", 0.0, 1.0, 0.2)
     
     # Carregando modelos com indicador de progresso
     with st.spinner("Carregando modelos..."):
@@ -125,82 +141,51 @@ def main():
             st.subheader("Imagem Original")
             st.image(image, channels="BGR")
         
-        # Detectando objetos na imagem
-        with st.spinner("Processando imagem..."):
-            results = model(image)
-        
-        # Processando detecções
-        detections = []
         output_image = image.copy()
+        detections = []
         
-        # Primeiro, vamos tentar processar a imagem inteira
-        plate_text_full = process_plate(image, reader)
-        if plate_text_full:
-            height, width = image.shape[:2]
-            detections.append({
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'placa': plate_text_full,
-                'thumbnail_path': 'thumbnails/full_image.jpg',
-                'confianca': 1.0
-            })
-            cv2.putText(output_image, plate_text_full, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        # Primeiro tenta processar a imagem inteira
+        plate_result = process_image_region(image, reader)
         
-        # Depois, vamos processar as detecções do YOLO
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+        if plate_result:
+            plate_text, conf = plate_result
+            if conf > confidence_threshold:
+                detections.append({
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'placa': plate_text,
+                    'confianca': conf
+                })
+                cv2.putText(output_image, f"{plate_text} ({conf:.2f})", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Se não encontrou na imagem inteira, procura por regiões candidatas
+        if not detections:
+            candidates = find_plate_candidates(image)
+            
+            for x, y, w, h in candidates:
+                plate_result = process_image_region(image, reader, x, y, w, h)
                 
-                # Expande a região
-                height, width = image.shape[:2]
-                y1 = max(0, y1 - 30)
-                y2 = min(height, y2 + 30)
-                x1 = max(0, x1 - 30)
-                x2 = min(width, x2 + 30)
-                
-                # Recortando a região do veículo
-                vehicle_region = image[y1:y2, x1:x2]
-                
-                # Processando OCR na região
-                plate_text = process_plate(vehicle_region, reader)
-                
-                if plate_text:
-                    # Salvando thumbnail
-                    os.makedirs('thumbnails', exist_ok=True)
-                    thumbnail_path = f"thumbnails/{plate_text}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                    cv2.imwrite(thumbnail_path, vehicle_region)
-                    
-                    # Preparando dados para salvar
-                    detection_data = {
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'placa': plate_text,
-                        'thumbnail_path': thumbnail_path,
-                        'confianca': float(box.conf[0])
-                    }
-                    
-                    detections.append(detection_data)
-                    st.session_state.detections_data.append(detection_data)
-                    
-                    # Desenhando retângulo e texto na imagem
-                    cv2.rectangle(output_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(output_image, plate_text, (x1, y1-10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                if plate_result:
+                    plate_text, conf = plate_result
+                    if conf > confidence_threshold:
+                        detections.append({
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'placa': plate_text,
+                            'confianca': conf
+                        })
+                        cv2.rectangle(output_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        cv2.putText(output_image, f"{plate_text} ({conf:.2f})", (x, y-10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
         with col2:
             st.subheader("Detecções")
             st.image(output_image, channels="BGR")
         
-        # Mostrando e salvando detecções
         if detections:
             st.subheader("Registro de Detecções")
-            df = pd.DataFrame(st.session_state.detections_data)
+            df = pd.DataFrame(detections)
             st.dataframe(df, use_container_width=True)
             
-            # Salvando em CSV
-            df.to_csv('deteccoes.csv', index=False)
-            
-            # Botão para baixar CSV
             if st.button("Baixar Registros (CSV)"):
                 csv = df.to_csv(index=False)
                 st.download_button(
