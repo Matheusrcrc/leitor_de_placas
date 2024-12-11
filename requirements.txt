@@ -6,3 +6,4 @@ easyocr
 pandas
 Pillow
 requests
+pytesseract
